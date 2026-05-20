@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Apply candidate mutations across the sandbox and aggregate results.
+#
+# Reads ast-grep `scan` matches as JSONL from stdin (output of
+# `scripts/enumerate`), partitions them by file across N parallel jobs,
+# runs each mutation through `core/mutation --apply` in its assigned
+# sandbox, and emits one JSON record per candidate to stdout. A
+# killed/survived/compile-error tally goes to stderr after the fan-out
+# completes.
+#
+# Usage:
+#   apply --jobs N --test-cmd "..." < candidates.jsonl > results.txt
+#
+# Flags:
+#   --jobs N         Parallelism. Each job runs in sandbox 1..N, all of
+#                    which must already exist (created by
+#                    `sandbox setup N`).
+#   --test-cmd CMD   Shell command run inside each sandbox per mutation.
+#                    Passed verbatim to `core/mutation --apply`. Must
+#                    exit 0 iff the suite passes — no pipes that swallow
+#                    exit codes.
+#
+# Output (stdout, one JSONL record per candidate):
+#   {file, line, ruleId, text, replacement, result}
+#   where result is one of: killed | survived | compile-error
+#
+# Output (stderr, after wait):
+#   <count> <classification>     # for each unique classification
+#
+# Requires: jq, plus everything `core/mutation --apply` needs.
+
+set -uo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+
+usage() {
+  echo "usage: apply --jobs N --test-cmd CMD < candidates.jsonl" >&2
+  exit 2
+}
+
+jobs=""
+test_cmd=""
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --jobs)     jobs="$2"; shift 2 ;;
+    --test-cmd) test_cmd="$2"; shift 2 ;;
+    *) usage ;;
+  esac
+done
+
+[ -z "$jobs" ] || [ -z "$test_cmd" ] && usage
+[[ "$jobs" =~ ^[0-9]+$ ]] && [ "$jobs" -gt 0 ] \
+  || { echo "apply: --jobs must be a positive integer" >&2; exit 2; }
+
+command -v jq >/dev/null 2>&1 \
+  || { echo "apply: jq required but not installed" >&2; exit 2; }
+
+for i in $(seq 1 "$jobs"); do
+  [ -d "/tmp/mutation-$i" ] \
+    || { echo "apply: /tmp/mutation-$i not found (run 'sandbox setup $jobs' first)" >&2; exit 2; }
+done
+
+# Stage candidates into per-job JSONL files, partitioned by file so
+# mutations on the same file land in the same sandbox (avoids races on
+# the same path).
+staging=$(mktemp -d)
+trap 'rm -rf "${staging:-}"' EXIT
+
+candidates="$staging/candidates.jsonl"
+cat > "$candidates"
+
+if [ ! -s "$candidates" ]; then
+  echo "apply: stdin had no candidates" >&2
+  exit 0
+fi
+
+for i in $(seq 1 "$jobs"); do
+  : > "$staging/$i.jsonl"
+done
+
+idx=0
+while IFS= read -r f; do
+  w=$(( (idx % jobs) + 1 ))
+  jq -c --arg f "$f" 'select(.file == $f)' "$candidates" \
+    >> "$staging/$w.jsonl"
+  idx=$((idx + 1))
+done < <(jq -r '.file' "$candidates" | sort -u)
+
+# Fan out: each job drains its JSONL through core/mutation --apply,
+# writing one JSON record per candidate to a per-job output file.
+for i in $(seq 1 "$jobs"); do
+  (
+    while IFS= read -r m; do
+      r=$("$SCRIPT_DIR/core/mutation" --apply "$i" "$test_cmd" <<< "$m")
+      jq -c --arg r "$r" '
+        {
+          file: .file,
+          line: (.range.start.line + 1),
+          ruleId: .ruleId,
+          text: .text,
+          replacement: .replacement,
+          result: $r
+        }
+      ' <<< "$m"
+    done < "$staging/$i.jsonl"
+  ) > "$staging/$i-results.jsonl" &
+done
+wait
+
+cat "$staging"/*-results.jsonl
+
+jq -r '.result' "$staging"/*-results.jsonl \
+  | sort | uniq -c >&2

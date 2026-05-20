@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Worktree-sandbox lifecycle for mutation testing.
+#
+# A sandbox is N detached-HEAD worktrees of the current branch, indexed
+# 1..N, living under `/tmp/mutation-<i>`. Mutations apply atomically
+# inside a sandbox and revert via `git checkout HEAD` between runs, so
+# the main checkout is never touched.
+#
+# Subcommands:
+#   sandbox setup N [--link DIR]...
+#       Create sandboxes 1..N. Each --link DIR is symlinked from the
+#       main repo into every sandbox at the same relative path (e.g.
+#       `node_modules`, `_build`, `deps`) so tests run without
+#       reinstalls.
+#
+#   sandbox teardown N
+#       Remove sandboxes 1..N and the `/tmp/mutate-*` and
+#       `/tmp/mutation-*` scratch files. Safe to re-run; missing paths
+#       are skipped.
+#
+# Examples:
+#   sandbox setup 4 --link assets/node_modules --link _build --link deps
+#   sandbox teardown 4
+#
+# Requires: git, scripts/core/worktree.
+
+set -uo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+
+usage() {
+  echo "usage: sandbox {setup N [--link DIR]... | teardown N}" >&2
+  exit 2
+}
+
+require_positive_int() {
+  local label="$1" value="$2"
+  [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -gt 0 ] \
+    || { echo "sandbox: $label must be a positive integer" >&2; exit 2; }
+}
+
+cmd_setup() {
+  local count="${1:-}"; shift || true
+  [ -z "$count" ] && usage
+  require_positive_int "N" "$count"
+
+  local links=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --link) links+=("--link" "$2"); shift 2 ;;
+      *) echo "sandbox setup: unknown flag '$1'" >&2; exit 2 ;;
+    esac
+  done
+
+  for i in $(seq 1 "$count"); do
+    "$SCRIPT_DIR/core/worktree" --add "$i" "${links[@]}"
+  done
+}
+
+cmd_teardown() {
+  local count="${1:-}"
+  [ -z "$count" ] && usage
+  require_positive_int "N" "$count"
+
+  for i in $(seq 1 "$count"); do
+    "$SCRIPT_DIR/core/worktree" --remove "$i"
+  done
+
+  rm -f /tmp/mutate-* /tmp/mutation-*
+}
+
+case "${1:-}" in
+  setup)    shift; cmd_setup "$@" ;;
+  teardown) shift; cmd_teardown "$@" ;;
+  *) usage ;;
+esac

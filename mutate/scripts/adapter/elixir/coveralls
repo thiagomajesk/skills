@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# ExUnit + excoveralls adapter for mutation testing (Elixir).
+#
+# Coverage uses `mix coveralls.json`; the adapter parses
+# `cover/excoveralls.json` after each `covered` run. Test counts come from
+# the trailing summary line of `mix test`. All verbs invoke mix in the
+# current working directory.
+#
+# Subcommands:
+#   coveralls covered [MIX-ARGS...]
+#       Runs `mix coveralls.json`, parses cover/excoveralls.json, emits
+#       repo-relative `<file>:<line>` pairs for executed lines, sorted
+#       unique. Exit 0 if mix passed; non-zero otherwise.
+#
+#   coveralls baseline [MIX-ARGS...]
+#       Runs `mix test`, prints a one-line JSON envelope:
+#         {"status":"green"|"red","passed":N,"failed":N,"total":N}
+#       Exit 0 only when status == "green". Used to confirm the suite is
+#       green in the freshly-created worktree before mutating.
+#
+#   coveralls run [MIX-ARGS...]
+#       Hot path. Runs `mix test "$@"` with stdout/stderr passthrough and
+#       exits with mix's exit code. Safe to pass as TEST-CMD to
+#       `core/mutation --apply`.
+#
+# Examples:
+#   coveralls covered test/my_app/feature
+#   coveralls baseline test/my_app/feature
+#   coveralls run test/my_app/feature
+#
+# Requires: mix (with :excoveralls in mix.exs), jq.
+
+set -uo pipefail
+
+MIX_BIN="${MIX_BIN:-mix}"
+
+require_tools() {
+  local missing=()
+  for t in "$@"; do
+    if ! command -v "$t" >/dev/null 2>&1; then
+      missing+=("$t")
+    fi
+  done
+  if [ "${#missing[@]}" -gt 0 ]; then
+    echo "adapter/elixir/coveralls: required tools not installed: ${missing[*]}" >&2
+    exit 2
+  fi
+}
+
+cmd_covered() {
+  require_tools jq
+
+  # Clear stale coverage to avoid reading data from a previous run.
+  rm -f cover/excoveralls.json
+
+  local mix_exit
+  $MIX_BIN coveralls.json "$@" >/dev/null 2>&1
+  mix_exit=$?
+
+  if [ "$mix_exit" -ne 0 ]; then
+    echo "adapter/elixir/coveralls covered: mix coveralls.json exited $mix_exit" >&2
+    return "$mix_exit"
+  fi
+
+  if [ ! -f cover/excoveralls.json ]; then
+    echo "adapter/elixir/coveralls covered: cover/excoveralls.json missing after run" >&2
+    return 3
+  fi
+
+  jq -r '
+    .source_files[]
+    | .name as $name
+    | .coverage
+    | to_entries[]
+    | select(.value != null and .value > 0)
+    | $name + ":" + ((.key + 1) | tostring)
+  ' cover/excoveralls.json | sort -u
+}
+
+cmd_baseline() {
+  require_tools jq
+
+  local output mix_exit
+  output=$($MIX_BIN test "$@" 2>&1)
+  mix_exit=$?
+
+  # ExUnit's summary line ends with `<n> tests, <m> failures` (with
+  # optional doctests/properties/skipped prefixes/suffixes).
+  local total failed
+  total=$(printf '%s\n' "$output" | grep -oE '[0-9]+ tests?,' | tail -1 | grep -oE '[0-9]+')
+  failed=$(printf '%s\n' "$output" | grep -oE '[0-9]+ failures?' | tail -1 | grep -oE '[0-9]+')
+
+  total=${total:-0}
+  failed=${failed:-0}
+  local passed=$(( total - failed ))
+
+  local status
+  if [ "$mix_exit" -eq 0 ]; then
+    status="green"
+  else
+    status="red"
+  fi
+
+  jq -nc \
+    --arg status "$status" \
+    --argjson passed "$passed" \
+    --argjson failed "$failed" \
+    --argjson total "$total" \
+    '{status:$status, passed:$passed, failed:$failed, total:$total}'
+
+  return "$mix_exit"
+}
+
+cmd_run() {
+  exec $MIX_BIN test "$@"
+}
+
+case "${1:-}" in
+  covered)  shift; cmd_covered "$@" ;;
+  baseline) shift; cmd_baseline "$@" ;;
+  run)      shift; cmd_run "$@" ;;
+  *)
+    echo "usage: $0 {covered|baseline|run} [MIX-ARGS...]" >&2
+    exit 2
+    ;;
+esac

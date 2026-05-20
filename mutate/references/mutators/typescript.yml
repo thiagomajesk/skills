@@ -1,0 +1,62 @@
+# TypeScript / JavaScript ast-grep rules for mutation testing.
+# See ../mutators.md for prose descriptions of each operator.
+
+id: comparison-flip-lt-ts
+language: TypeScript
+rule:
+  pattern: $A < $B
+fix: $A <= $B
+---
+id: comparison-flip-gt-ts
+language: TypeScript
+rule:
+  pattern: $A > $B
+fix: $A >= $B
+---
+id: equality-flip-ts
+language: TypeScript
+rule:
+  pattern: $A === $B
+fix: $A !== $B
+---
+id: boolean-and-to-or-ts
+language: TypeScript
+rule:
+  pattern: $A && $B
+fix: $A || $B
+---
+id: arith-plus-to-minus-ts
+language: TypeScript
+rule:
+  pattern: $A + $B
+fix: $A - $B
+---
+id: boolean-true-to-false-ts
+language: TypeScript
+rule:
+  pattern: 'true'
+fix: 'false'
+---
+id: boolean-false-to-true-ts
+language: TypeScript
+rule:
+  pattern: 'false'
+fix: 'true'
+---
+id: optional-chain-drop-ts
+language: TypeScript
+rule:
+  pattern: $A?.$B
+fix: $A.$B
+---
+id: await-drop-ts
+language: TypeScript
+rule:
+  pattern: await $E
+fix: $E
+---
+id: array-filter-keep-all-ts
+language: TypeScript
+rule:
+  pattern: $ARR.filter($PRED)
+fix: $ARR

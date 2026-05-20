@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# Jest adapter for mutation testing.
+#
+# A framework-specific adapter that exposes a uniform interface the skill
+# uses to: discover which lines the tests actually execute, confirm the
+# suite is green before mutating, and run the suite during apply. All
+# verbs invoke jest in the current working directory, so callers cd into
+# the project's jest root (e.g. `cd assets`) before invoking.
+#
+# Subcommands:
+#   jest covered [JEST-ARGS...]
+#       Runs jest with statement-level coverage, parses
+#       `coverage/coverage-final.json`, emits repo-relative `<file>:<line>`
+#       pairs for executed statements, one per line, sorted unique.
+#       Exit 0 if jest passed; non-zero (with stderr) if it failed.
+#
+#   jest baseline [JEST-ARGS...]
+#       Runs jest, prints a one-line JSON envelope describing the run:
+#         {"status":"green"|"red","passed":N,"failed":N,"total":N}
+#       Exit 0 only when status == "green". Used to confirm the suite is
+#       green in the freshly-created worktree before mutating.
+#
+#   jest run [JEST-ARGS...]
+#       Hot path. Runs `jest "$@"` with stdout/stderr passthrough and
+#       exits with jest's exit code. Safe to pass as the TEST-CMD to
+#       `core/mutation --apply` — no pipes, no output redirection, exit
+#       code reflects the test outcome.
+#
+# Examples:
+#   (cd assets && adapter/javascript/jest covered js/hooks/my_feature)
+#   (cd assets && adapter/javascript/jest baseline js/hooks/my_feature)
+#   (cd assets && adapter/javascript/jest run js/hooks/my_feature)
+#
+# Honoured env vars (forwarded to jest):
+#   TZ, NODE_OPTIONS, JEST_WORKERS, anything else in the caller's env.
+#
+# Requires: npx (jest resolved via the project's node_modules), jq, git.
+
+set -uo pipefail
+
+JEST_BIN="${JEST_BIN:-npx jest}"
+
+require_tools() {
+  local missing=()
+  for t in "$@"; do
+    if ! command -v "$t" >/dev/null 2>&1; then
+      missing+=("$t")
+    fi
+  done
+  if [ "${#missing[@]}" -gt 0 ]; then
+    echo "adapter/javascript/jest: required tools not installed: ${missing[*]}" >&2
+    exit 2
+  fi
+}
+
+repo_relative_prefix() {
+  # Path prefix to strip from coverage-final.json keys so paths come out
+  # as `<repo-relative>`. Falls back to nothing if not in a git tree.
+  local top
+  top=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+  printf '%s/' "$top"
+}
+
+cmd_covered() {
+  require_tools jq git
+
+  local cov_dir
+  cov_dir=$(mktemp -d)
+  trap 'rm -rf "${cov_dir:-}"' EXIT
+
+  local jest_exit
+  $JEST_BIN \
+    --coverage \
+    --coverageReporters=json \
+    --coverageDirectory="$cov_dir" \
+    "$@" \
+    >/dev/null 2>&1
+  jest_exit=$?
+
+  if [ "$jest_exit" -ne 0 ]; then
+    echo "adapter/javascript/jest covered: jest exited $jest_exit; coverage not emitted" >&2
+    return "$jest_exit"
+  fi
+
+  local cov_file="$cov_dir/coverage-final.json"
+  if [ ! -f "$cov_file" ]; then
+    echo "adapter/javascript/jest covered: $cov_file missing (did jest write coverage?)" >&2
+    return 3
+  fi
+
+  local prefix
+  prefix=$(repo_relative_prefix)
+
+  jq -r --arg prefix "$prefix" '
+    to_entries[]
+    | (.key | sub("^" + $prefix; "")) as $file
+    | .value.statementMap as $sm
+    | .value.s | to_entries[]
+    | select(.value > 0)
+    | $file + ":" + ($sm[.key].start.line | tostring)
+  ' "$cov_file" | sort -u
+}
+
+cmd_baseline() {
+  require_tools jq
+
+  local result_file
+  result_file=$(mktemp)
+  trap 'rm -f "${result_file:-}"' EXIT
+
+  $JEST_BIN --json "$@" >"$result_file" 2>/dev/null
+  local jest_exit=$?
+
+  if [ ! -s "$result_file" ]; then
+    # jest --json normally always writes the envelope, even on failure;
+    # an empty file means jest crashed before parsing tests.
+    jq -nc --arg err "jest produced no output (exit $jest_exit)" \
+      '{status:"red", passed:0, failed:0, total:0, error:$err}'
+    return 3
+  fi
+
+  jq -c '
+    {
+      status: (if .success then "green" else "red" end),
+      passed: .numPassedTests,
+      failed: .numFailedTests,
+      total:  .numTotalTests
+    }
+  ' "$result_file"
+
+  return "$jest_exit"
+}
+
+cmd_run() {
+  exec $JEST_BIN "$@"
+}
+
+case "${1:-}" in
+  covered)  shift; cmd_covered "$@" ;;
+  baseline) shift; cmd_baseline "$@" ;;
+  run)      shift; cmd_run "$@" ;;
+  *)
+    echo "usage: $0 {covered|baseline|run} [JEST-ARGS...]" >&2
+    exit 2
+    ;;
+esac

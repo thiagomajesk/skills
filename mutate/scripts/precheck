@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Refuse bad scope before mutation testing begins.
+#
+# Mutation testing rewrites real files in a detached worktree and re-runs
+# the test suite per candidate. Running it against a protected branch or
+# on top of uncommitted work is unsafe — only committed code on a feature
+# branch should be touched. This script asserts that contract.
+#
+# Usage:
+#   precheck
+#
+# Exits 0 if the current repository is safe to mutate, non-zero with a
+# message on stderr otherwise. Run from inside the repository.
+#
+# Checks (any failure aborts):
+#   - HEAD must be on a named branch (not detached)
+#   - Working tree must be clean (`git status --porcelain` empty)
+#   - Branch must not be one of: main, master, dev
+#
+# Requires: git.
+
+set -uo pipefail
+
+fail() { echo "precheck: $1" >&2; exit 2; }
+
+command -v git >/dev/null 2>&1 || fail "git not installed"
+
+branch=$(git symbolic-ref --short -q HEAD 2>/dev/null) \
+  || fail "HEAD is detached; check out a feature branch first"
+
+if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+  fail "working tree is dirty; commit or stash before mutating"
+fi
+
+case "$branch" in
+  main|master|dev)
+    fail "refusing to mutate on protected branch '$branch'"
+    ;;
+esac
+
+echo "precheck: branch '$branch' is safe to mutate"

@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Enumerate mutation candidates via ast-grep's native scan.
+#
+# Runs `ast-grep scan --inline-rules` with the rule catalogue against the
+# union of files in TARGET-LINES, then filters the match stream down to
+# matches whose start line is in the target set. Output is JSONL ready
+# to feed into `scripts/apply`.
+#
+# Usage:
+#   enumerate --rules PATH --target-lines FILE --worktree NAME
+#
+# Flags:
+#   --rules PATH          A `.yml` file or a directory of `.yml` files
+#                         (one per language is the convention). Each
+#                         rule is a native ast-grep rule defining `id`,
+#                         `language`, `rule.pattern`, and `fix`. Multiple
+#                         rules in one file are separated by `---`; when
+#                         PATH is a directory, files are concatenated in
+#                         lexical order with `---` injected between them.
+#   --target-lines FILE   `<file>:<line>` set (output of core/lines --changed
+#                         intersected with adapter `covered`).
+#   --worktree NAME       Name suffix of /tmp/mutation-<NAME>. scan runs
+#                         inside that worktree so paths in the JSON match
+#                         the target-lines set.
+#
+# Output: JSONL on stdout, one ast-grep `scan` match per line, with the
+# rule id, file, range, replacement, and replacementOffsets already
+# populated by ast-grep. Pipe straight into `scripts/apply`.
+#
+# Requires: ast-grep, jq.
+
+set -u
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+
+usage() {
+  echo "usage: enumerate --rules FILE --target-lines FILE --worktree NAME" >&2
+  exit 2
+}
+
+rules=""
+target_lines=""
+worktree_name=""
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --rules)        rules="$2"; shift 2 ;;
+    --target-lines) target_lines="$2"; shift 2 ;;
+    --worktree)     worktree_name="$2"; shift 2 ;;
+    *) usage ;;
+  esac
+done
+
+[ -z "$rules" ] || [ -z "$target_lines" ] || [ -z "$worktree_name" ] && usage
+[ -e "$rules" ] || { echo "enumerate: rules path '$rules' not found" >&2; exit 2; }
+[ -f "$target_lines" ] || { echo "enumerate: target-lines file '$target_lines' not found" >&2; exit 2; }
+
+# Concatenate YAML rule sources into a single inline-rules payload. A
+# directory becomes the lexical concatenation of its `*.yml` files with
+# `---` injected between them so ast-grep treats each file as a separate
+# rule group. A single file is used verbatim.
+if [ -d "$rules" ]; then
+  rule_files=("$rules"/*.yml)
+  if [ ! -e "${rule_files[0]}" ]; then
+    echo "enumerate: no *.yml files in '$rules'" >&2
+    exit 2
+  fi
+  inline_rules=$(awk 'FNR==1 && NR>1 { print "---" } { print }' "${rule_files[@]}")
+else
+  inline_rules=$(cat "$rules")
+fi
+
+worktree="/tmp/mutation-$worktree_name"
+[ -d "$worktree" ] || { echo "enumerate: worktree '$worktree' not found" >&2; exit 2; }
+
+for tool in ast-grep jq; do
+  command -v "$tool" >/dev/null 2>&1 \
+    || { echo "enumerate: '$tool' required but not installed" >&2; exit 2; }
+done
+
+# Collect the unique target files; pass them to scan as paths. ast-grep
+# auto-detects each file's language from its extension and applies only
+# the matching rules.
+files=()
+while IFS= read -r f; do
+  files+=("$f")
+done < <(cut -d: -f1 "$target_lines" | sort -u)
+
+if [ "${#files[@]}" -eq 0 ]; then
+  exit 0
+fi
+
+(cd "$worktree" && ast-grep scan \
+  --inline-rules "$inline_rules" \
+  --json=stream \
+  "${files[@]}" 2>/dev/null) \
+  | "$SCRIPT_DIR/core/lines" --filter "$target_lines"

@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# Mutation apply primitive.
+#
+# Consumes one ast-grep `scan --json=stream` match from stdin, applies its
+# `replacement` at the match's byte offsets inside a named worktree, runs
+# the test command, classifies the outcome, and ALWAYS restores the file
+# via `git checkout HEAD` — even on Ctrl-C.
+#
+# Usage:
+#   mutation --apply WORKTREE-NAME TEST-CMD < one-match.json
+#
+# Stdin: a single line of JSON from `ast-grep scan --json=stream` — must
+# include `file`, `replacement`, and `replacementOffsets` (start/end byte
+# offsets in the pre-mutation file). The schema lines up with ast-grep's
+# native output; no annotation step is required.
+#
+# Stdout: one token — `killed`, `survived`, or `compile-error`.
+#
+# Env:
+#   MUTATE_TEST_TIMEOUT  seconds (default 300; 0 to disable)
+#   MUTATE_LOG_DIR       if set, captures test output per mutation
+#
+# Requires: jq.
+
+set -uo pipefail
+
+cmd_apply() {
+  local worktree_name="${1:-}"
+  local test_cmd="${2:-}"
+
+  if [ -z "$worktree_name" ] || [ -z "$test_cmd" ]; then
+    echo "usage: mutation --apply WORKTREE-NAME TEST-CMD (scan match JSON on stdin)" >&2
+    exit 2
+  fi
+
+  local worktree="/tmp/mutation-$worktree_name"
+  if [ ! -d "$worktree" ]; then
+    echo "mutation --apply: worktree $worktree does not exist (run 'worktree --add $worktree_name' first)" >&2
+    exit 2
+  fi
+
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "mutation --apply: jq required but not installed" >&2
+    exit 2
+  fi
+
+  local match_json; match_json=$(cat)
+
+  local required='["file","replacement","replacementOffsets"]'
+  local missing
+  missing=$(jq -r --argjson req "$required" '
+    . as $m | [$req[] | . as $k | select($m | has($k) | not)] | join(",")
+  ' <<< "$match_json")
+  if [ -n "$missing" ]; then
+    echo "mutation --apply: match JSON missing fields: $missing" >&2
+    echo "(input should come from 'ast-grep scan --json=stream')" >&2
+    exit 2
+  fi
+
+  local file start end
+  file=$(jq -r '.file' <<< "$match_json")
+  start=$(jq -r '.replacementOffsets.start' <<< "$match_json")
+  end=$(jq -r '.replacementOffsets.end' <<< "$match_json")
+
+  local target="$worktree/$file"
+  if [ ! -f "$target" ]; then
+    echo "mutation --apply: $target does not exist in the worktree" >&2
+    exit 2
+  fi
+
+  # Bake the cleanup into the trap string so the EXIT handler still has
+  # access to $file after locals go out of scope.
+  trap "(cd '$worktree' && git checkout HEAD -- '$file' 2>/dev/null) || true" EXIT INT TERM
+
+  # Byte-level substitution: pre-match bytes, then replacement (written
+  # with jq -j to preserve raw bytes verbatim), then post-match bytes.
+  local tmp; tmp=$(mktemp)
+  {
+    head -c "$start" "$target"
+    jq -j '.replacement' <<< "$match_json"
+    tail -c +"$((end + 1))" "$target"
+  } > "$tmp"
+  mv "$tmp" "$target"
+
+  local timeout="${MUTATE_TEST_TIMEOUT:-300}"
+  local warn_marker="/tmp/mutation-timeout-warned"
+  local runner=(env)
+  if [ "$timeout" -gt 0 ]; then
+    if command -v timeout >/dev/null 2>&1; then
+      runner=(timeout --kill-after=5 "$timeout")
+    elif command -v gtimeout >/dev/null 2>&1; then
+      runner=(gtimeout --kill-after=5 "$timeout")
+    elif [ ! -f "$warn_marker" ]; then
+      echo "warning: no timeout/gtimeout found; install GNU coreutils for timeout protection" >&2
+      touch "$warn_marker"
+    fi
+  fi
+
+  local log_file=""
+  if [ -n "${MUTATE_LOG_DIR:-}" ]; then
+    mkdir -p "$MUTATE_LOG_DIR"
+    local slug; slug=$(echo "$file" | tr '/' '_')
+    log_file="$MUTATE_LOG_DIR/${slug}-${start}.log"
+  fi
+
+  local test_output test_exit
+  test_output=$( cd "$worktree" && "${runner[@]}" bash -c "$test_cmd" 2>&1 )
+  test_exit=$?
+
+  if [ -n "$log_file" ]; then
+    printf '%s\n' "$test_output" > "$log_file"
+  fi
+
+  if [ "$test_exit" -eq 124 ] || [ "$test_exit" -eq 137 ]; then
+    echo "compile-error"
+  elif [ "$test_exit" -eq 0 ]; then
+    echo "survived"
+  elif echo "$test_output" | grep -iqE "compile|parse error|syntax error|undefined function|undefined variable|cannot find module|module not found|\\*\\* \\(.*Error\\)"; then
+    echo "compile-error"
+  else
+    echo "killed"
+  fi
+}
+
+case "${1:-}" in
+  --apply) shift; cmd_apply "$@" ;;
+  *)
+    echo "usage: $0 --apply WORKTREE-NAME TEST-CMD (scan match JSON on stdin)" >&2
+    exit 2
+    ;;
+esac

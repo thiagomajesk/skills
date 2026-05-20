@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# Verify a sandbox is ready to mutate.
+#
+# Two assertions, both run inside `/tmp/mutation-<worktree>`:
+#   1. Every unique file in TARGET-LINES is parseable by ast-grep. A
+#      file ast-grep can't parse will silently emit zero matches and
+#      skew the mutation score. Surface offenders rather than skip.
+#   2. The adapter's `baseline` verb reports green. Mutation outcomes
+#      are meaningless if the pristine tree already fails.
+#
+# Usage:
+#   preflight --adapter PATH --test-root DIR --scope SCOPE \
+#             --target-lines FILE --worktree N
+#
+# Flags:
+#   --adapter PATH       Path to a scripts/adapter/<lang>/<framework>.
+#   --test-root DIR      Subdirectory inside the sandbox where the
+#                        adapter runs (e.g. `assets` for Jest).
+#   --scope SCOPE        Passed to the adapter's `baseline` verb.
+#   --target-lines FILE  `<file>:<line>` set from `scripts/target`.
+#   --worktree N         Sandbox index to probe (e.g. `1`).
+#
+# Exit 0 on success. Non-zero with diagnostics on stderr if any target
+# file fails to parse or the baseline is red.
+#
+# Requires: ast-grep, jq.
+
+set -uo pipefail
+
+usage() {
+  echo "usage: preflight --adapter PATH --test-root DIR --scope SCOPE --target-lines FILE --worktree N" >&2
+  exit 2
+}
+
+adapter=""
+test_root=""
+scope=""
+target_lines=""
+worktree=""
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --adapter)      adapter="$2"; shift 2 ;;
+    --test-root)    test_root="$2"; shift 2 ;;
+    --scope)        scope="$2"; shift 2 ;;
+    --target-lines) target_lines="$2"; shift 2 ;;
+    --worktree)     worktree="$2"; shift 2 ;;
+    *) usage ;;
+  esac
+done
+
+[ -z "$adapter" ] || [ -z "$test_root" ] || [ -z "$scope" ] && usage
+[ -z "$target_lines" ] || [ -z "$worktree" ] && usage
+[ -x "$adapter" ] || { echo "preflight: adapter '$adapter' not executable" >&2; exit 2; }
+[ -f "$target_lines" ] || { echo "preflight: target-lines '$target_lines' not found" >&2; exit 2; }
+
+sandbox_path="/tmp/mutation-$worktree"
+[ -d "$sandbox_path" ] \
+  || { echo "preflight: '$sandbox_path' not found (run 'sandbox setup' first)" >&2; exit 2; }
+
+adapter=$(cd "$(dirname "$adapter")" && pwd)/$(basename "$adapter")
+
+# Probe ast-grep on every unique target file.
+unsupported=()
+while IFS= read -r f; do
+  if ! ast-grep run -p '$_' --json=compact "$sandbox_path/$f" >/dev/null 2>&1; then
+    unsupported+=("$f")
+  fi
+done < <(cut -d: -f1 "$target_lines" | sort -u)
+
+if [ "${#unsupported[@]}" -gt 0 ]; then
+  echo "preflight: ast-grep can't parse these files:" >&2
+  for f in "${unsupported[@]}"; do echo "  $f" >&2; done
+  exit 3
+fi
+
+result=$(cd "$sandbox_path/$test_root" && "$adapter" baseline "$scope")
+echo "preflight: baseline → $result"
+
+echo "$result" | jq -e '.status == "green"' >/dev/null \
+  || { echo "preflight: baseline is red; refusing to mutate" >&2; exit 4; }

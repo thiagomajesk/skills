@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# Line-set operations for mutation testing.
+#
+# Computes the set of lines added or modified on the current branch (vs a base
+# ref) and filters streams of ast-grep matches to only those that land on
+# changed lines. The skill uses the output to scope mutation testing to code
+# the user actually wrote on this branch.
+#
+# Subcommands:
+#   lines --changed [BASE]
+#       Emit `<file>:<line>` pairs to stdout for added/modified lines between
+#       the current branch and BASE. BASE defaults to origin/HEAD (falling
+#       back to dev/main/master/develop). Skips deleted files.
+#
+#   lines --filter CHANGED-LINES-FILE
+#       Stream filter. Reads an ast-grep `--json=stream` output on stdin,
+#       writes only matches whose (file, range.start.line + 1) appears in
+#       CHANGED-LINES-FILE.
+#
+# Examples:
+#   lines --changed
+#   lines --changed origin/main
+#   lines --filter changed.txt < matches.jsonl
+#
+# Requires: git, awk, jq (for --filter).
+
+set -euo pipefail
+
+cmd_changed() {
+  local base="${1:-}"
+
+  resolve_base() {
+    if [ -n "$1" ]; then echo "$1"; return; fi
+    local origin_head
+    origin_head=$(git symbolic-ref --short -q refs/remotes/origin/HEAD 2>/dev/null) || true
+    if [ -n "$origin_head" ] && git rev-parse --verify --quiet "$origin_head" >/dev/null; then
+      echo "$origin_head"; return
+    fi
+    for c in origin/dev origin/main origin/master origin/develop dev main master develop; do
+      if git rev-parse --verify --quiet "$c" >/dev/null; then echo "$c"; return; fi
+    done
+    return 1
+  }
+
+  if ! base=$(resolve_base "$base"); then
+    echo "lines --changed: could not resolve a base branch (tried origin/HEAD, dev, main, master, develop)" >&2
+    exit 2
+  fi
+
+  if ! git rev-parse --verify "$base" >/dev/null 2>&1; then
+    echo "lines --changed: base ref '$base' not found" >&2
+    exit 2
+  fi
+
+  git diff "$base"...HEAD --unified=0 --no-color --diff-filter=AM 2>/dev/null \
+    | awk '
+        /^\+\+\+ b\// { sub("^\\+\\+\\+ b/", "", $0); file = $0; next }
+        /^@@/ {
+          match($0, /\+[0-9]+(,[0-9]+)?/)
+          hunk = substr($0, RSTART + 1, RLENGTH - 1)
+          split(hunk, parts, ",")
+          start = parts[1] + 0
+          count = (length(parts) >= 2) ? parts[2] + 0 : 1
+          for (i = 0; i < count; i++) print file ":" (start + i)
+        }
+      ' \
+    | sort -u
+}
+
+cmd_filter() {
+  local changed="${1:-}"
+
+  if [ -z "$changed" ]; then
+    echo "usage: lines --filter CHANGED-LINES-FILE" >&2
+    exit 2
+  fi
+  if [ ! -f "$changed" ]; then
+    echo "lines --filter: file '$changed' not found" >&2
+    exit 2
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "lines --filter: jq required but not installed" >&2
+    exit 2
+  fi
+
+  jq --rawfile pairs "$changed" -cM '
+    ($pairs
+      | split("\n")
+      | map(select(length > 0))
+      | reduce .[] as $p ({}; . + {($p): true})
+    ) as $set
+    | (.file | sub("^\\./"; "")) as $f
+    | select($set[$f + ":" + ((.range.start.line + 1) | tostring)] == true)
+  '
+}
+
+case "${1:-}" in
+  --changed) shift; cmd_changed "$@" ;;
+  --filter)  shift; cmd_filter "$@" ;;
+  *)
+    echo "usage: $0 {--changed [BASE] | --filter CHANGED-LINES-FILE}" >&2
+    exit 2
+    ;;
+esac

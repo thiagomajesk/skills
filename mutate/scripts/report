@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Format `apply` results for humans.
+#
+# Reads the JSONL stream produced by `scripts/apply` and emits one line
+# per matching record:
+#
+#   <file>:<line>  <ruleId>  <text> -> <replacement>
+#
+# Multi-line `text` / `replacement` are flattened to a single line with
+# `\n` literals so each record stays grep-friendly.
+#
+# Usage:
+#   report [--result CLASS] [FILE]
+#
+# Flags:
+#   --result CLASS   Filter by result. One of `survived`, `killed`,
+#                    `compile-error`, or `any`. Default: `survived` —
+#                    that's the actionable output the skill cares about.
+#
+# Positional:
+#   FILE             JSONL file to read. Defaults to stdin.
+#
+# Examples:
+#   report /tmp/mutate-results.jsonl                  # survivors only
+#   report --result killed /tmp/mutate-results.jsonl  # what tests caught
+#   report --result any < /tmp/mutate-results.jsonl   # full table
+#
+# Requires: jq.
+
+set -uo pipefail
+
+result_filter="survived"
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --result)
+      result_filter="$2"; shift 2 ;;
+    --) shift; break ;;
+    -*) echo "report: unknown flag '$1'" >&2; exit 2 ;;
+    *)  break ;;
+  esac
+done
+
+input="${1:-/dev/stdin}"
+[ "$input" = "/dev/stdin" ] || [ -f "$input" ] \
+  || { echo "report: '$input' not found" >&2; exit 2; }
+
+command -v jq >/dev/null 2>&1 \
+  || { echo "report: jq required but not installed" >&2; exit 2; }
+
+jq -r --arg filter "$result_filter" '
+  select($filter == "any" or .result == $filter)
+  | "\(.file):\(.line)  \(.ruleId)  \(.text | gsub("\n"; "\\n")) -> \(.replacement | gsub("\n"; "\\n"))"
+' "$input"

@@ -1,0 +1,62 @@
+# Elixir ast-grep rules for mutation testing.
+# See ../mutators.md for prose descriptions of each operator.
+
+id: comparison-flip-lt-elixir
+language: Elixir
+rule:
+  pattern: $A < $B
+fix: $A <= $B
+---
+id: comparison-flip-gt-elixir
+language: Elixir
+rule:
+  pattern: $A > $B
+fix: $A >= $B
+---
+id: equality-flip-elixir
+language: Elixir
+rule:
+  pattern: $A == $B
+fix: $A != $B
+---
+id: and-to-or-elixir
+language: Elixir
+rule:
+  pattern: $A and $B
+fix: $A or $B
+---
+id: andand-to-oror-elixir
+language: Elixir
+rule:
+  pattern: $A && $B
+fix: $A || $B
+---
+id: arith-plus-to-minus-elixir
+language: Elixir
+rule:
+  pattern: $A + $B
+fix: $A - $B
+---
+id: ok-to-error-elixir
+language: Elixir
+rule:
+  pattern: '{:ok, $X}'
+fix: '{:error, $X}'
+---
+id: boolean-true-to-false-elixir
+language: Elixir
+rule:
+  pattern: 'true'
+fix: 'false'
+---
+id: boolean-false-to-true-elixir
+language: Elixir
+rule:
+  pattern: 'false'
+fix: 'true'
+---
+id: pipe-step-removal-elixir
+language: Elixir
+rule:
+  pattern: $A |> $F($$$ARGS)
+fix: $A

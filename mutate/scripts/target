@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Emit the target line set for mutation testing.
+#
+# Combines the branch diff with the adapter's coverage report and emits
+# the intersection: `<file>:<line>` pairs that are both changed on this
+# branch AND executed by the test suite. Lines outside the intersection
+# would auto-survive (no test runs them) or be off-topic (not on this
+# branch), so they aren't worth mutating.
+#
+# Usage:
+#   target --adapter PATH --test-root DIR --scope SCOPE
+#
+# Flags:
+#   --adapter PATH     Path to a scripts/adapter/<lang>/<framework> script.
+#                      Must implement `covered SCOPE`.
+#   --test-root DIR    Working directory the adapter runs in (e.g.
+#                      `assets` for Jest, `.` for mix).
+#   --scope SCOPE      Argument passed to the adapter's `covered` verb,
+#                      narrowing which tests run.
+#
+# Output: `<file>:<line>` pairs to stdout, sorted unique. Exit 0 even when
+# the intersection is empty — the caller decides what to do with that.
+#
+# Requires: git, sort, comm; everything `core/lines` and the chosen
+# adapter need.
+
+set -uo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+
+usage() {
+  echo "usage: target --adapter PATH --test-root DIR --scope SCOPE" >&2
+  exit 2
+}
+
+adapter=""
+test_root=""
+scope=""
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --adapter)   adapter="$2"; shift 2 ;;
+    --test-root) test_root="$2"; shift 2 ;;
+    --scope)     scope="$2"; shift 2 ;;
+    *) usage ;;
+  esac
+done
+
+[ -z "$adapter" ] || [ -z "$test_root" ] || [ -z "$scope" ] && usage
+[ -x "$adapter" ] || { echo "target: adapter '$adapter' not executable" >&2; exit 2; }
+[ -d "$test_root" ] || { echo "target: test-root '$test_root' not a directory" >&2; exit 2; }
+
+# Resolve adapter to an absolute path so `cd $test_root && $adapter ...`
+# still finds the script.
+adapter=$(cd "$(dirname "$adapter")" && pwd)/$(basename "$adapter")
+
+tmp=$(mktemp -d)
+trap 'rm -rf "${tmp:-}"' EXIT
+
+"$SCRIPT_DIR/core/lines" --changed | sort -u > "$tmp/changed"
+(cd "$test_root" && "$adapter" covered "$scope") | sort -u > "$tmp/covered"
+
+comm -12 "$tmp/changed" "$tmp/covered"

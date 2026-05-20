@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# Worktree management for mutation testing.
+#
+# Each named worktree lives at /tmp/mutation-<NAME>, checked out from the
+# current HEAD in detached mode. Build-artifact directories can be symlinked
+# from the main repo at creation time via repeated `--link DIR` flags; the
+# script makes no assumption about which directories you need.
+#
+# Subcommands:
+#   worktree --add NAME [--link DIR]...
+#       Create one worktree at /tmp/mutation-<NAME>. For each --link DIR,
+#       symlink <main-repo>/<DIR> into the worktree at the same relative path.
+#
+#   worktree --remove NAME
+#       Remove the worktree by name. No-op if it doesn't exist.
+#
+# Examples:
+#   worktree --add 1
+#   worktree --add 2 --link node_modules
+#   worktree --remove 1
+#
+# Requires: git.
+
+set -euo pipefail
+
+worktree_path() {
+  echo "/tmp/mutation-$1"
+}
+
+cmd_add() {
+  local name=""
+  local link_dirs=()
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --link)
+        if [ "$#" -lt 2 ]; then
+          echo "worktree --add: --link requires a DIR argument" >&2
+          exit 2
+        fi
+        link_dirs+=("$2")
+        shift 2
+        ;;
+      --*)
+        echo "worktree --add: unknown flag '$1'" >&2
+        exit 2
+        ;;
+      *)
+        if [ -z "$name" ]; then
+          name="$1"
+        else
+          echo "worktree --add: unexpected positional argument '$1' (NAME already set to '$name')" >&2
+          exit 2
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  if [ -z "$name" ]; then
+    echo "usage: worktree --add NAME [--link DIR]..." >&2
+    exit 2
+  fi
+
+  local path; path=$(worktree_path "$name")
+
+  if [ -d "$path" ]; then
+    git worktree remove --force "$path" 2>/dev/null || rm -rf "$path"
+    git worktree prune 2>/dev/null || true
+  fi
+
+  git worktree add "$path" HEAD --detach >/dev/null
+
+  if [ "${#link_dirs[@]}" -gt 0 ]; then
+    local main_repo; main_repo=$(git rev-parse --show-toplevel)
+    for dir in "${link_dirs[@]}"; do
+      local src="$main_repo/$dir"
+      local dst="$path/$dir"
+      if [ ! -e "$src" ]; then
+        echo "worktree --add: warning, --link source '$dir' not found in main repo; skipping" >&2
+        continue
+      fi
+      if [ -e "$dst" ]; then
+        continue
+      fi
+      mkdir -p "$(dirname "$dst")"
+      ln -s "$src" "$dst"
+    done
+  fi
+
+  echo "$path"
+}
+
+cmd_remove() {
+  local name="${1:-}"
+  if [ -z "$name" ]; then
+    echo "usage: worktree --remove NAME" >&2
+    exit 2
+  fi
+
+  local path; path=$(worktree_path "$name")
+  if [ -d "$path" ]; then
+    git worktree remove --force "$path" 2>/dev/null || rm -rf "$path"
+    git worktree prune 2>/dev/null || true
+  fi
+}
+
+case "${1:-}" in
+  --add)    shift; cmd_add "$@" ;;
+  --remove) shift; cmd_remove "$@" ;;
+  *)
+    echo "usage: $0 {--add NAME [--link DIR]... | --remove NAME}" >&2
+    exit 2
+    ;;
+esac
